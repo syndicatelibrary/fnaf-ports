@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <base href="https://raw.githack.com/genizy/fnaf/main/3/">
+    <link rel="stylesheet" type="text/css" href="style.css"/>
+    <link rel="icon" type="image/x-icon" href="favicon.ico" />
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="viewport" content="initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, target-densitydpi=device-dpi" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="HandheldFriendly" content="true" />
+    <title>Five Nights at Freddy's 3</title>
+</head>
+<body>
+    <div style="display: inline-block; -webkit-user-select: none; text-align: left">
+        <canvas id="MMFCanvas" width="1280" height="720"> Your browser does not support Canvas, please try a different browser. </canvas>
+    </div>
+    <div id="progress-container">
+        <div style="margin-bottom: 6px;">Loading… <span id="download-text">0%</span></div>
+        <div style="width: 100%; background: #444; border-radius: 6px; overflow: hidden;">
+            <div id="download-bar" style="height: 10px; background: #3b82f6; width: 0%; transition: width 0.2s;"></div>
+        </div>
+        <div style="margin: 12px 0 6px;">Extracting… <span id="extract-text">0%</span></div>
+        <div style="width: 100%; background: #444; border-radius: 6px; overflow: hidden;">
+            <div id="extract-bar" style="height: 10px; background: #10b981; width: 0%; transition: width 0.2s;"></div>
+        </div>
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    
+<script>
+(function() {
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  function qs(id) { return document.getElementById(id); }
+  function fmt(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1048576) return (bytes/1024).toFixed(1) + ' KB';
+    return (bytes/1048576).toFixed(1) + ' MB';
+  }
+
+  // ── Build loader UI (replaces the placeholder progress-container) ────────
+  var pc = qs('progress-container');
+  pc.innerHTML = [
+    '<div id="stage-label" style="font-size:13px;font-weight:600;letter-spacing:.04em;margin-bottom:10px;color:#aaa;">Initialising…</div>',
+
+    // Download row
+    '<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">',
+    '  <span style="color:#60a5fa;font-weight:600;">⬇ Downloading</span>',
+    '  <span id="dl-info" style="color:#aaa;font-family:monospace;">—</span>',
+    '</div>',
+    '<div style="width:100%;background:#2a2a2a;border-radius:4px;overflow:hidden;margin-bottom:12px;">',
+    '  <div id="dl-bar" style="height:6px;background:#3b82f6;width:0%;transition:width .15s;"></div>',
+    '</div>',
+
+    // Extract row
+    '<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">',
+    '  <span style="color:#34d399;font-weight:600;">📦 Extracting</span>',
+    '  <span id="ex-count" style="color:#aaa;font-family:monospace;">—</span>',
+    '</div>',
+    '<div style="width:100%;background:#2a2a2a;border-radius:4px;overflow:hidden;margin-bottom:8px;">',
+    '  <div id="ex-bar" style="height:6px;background:#10b981;width:0%;transition:width .1s;"></div>',
+    '</div>',
+
+    // Current file ticker
+    '<div id="file-ticker" style="font-size:11px;color:#666;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:15px;"></div>',
+    '<div id="loader-error" style="color:#f87171;font-size:12px;margin-top:8px;display:none;"></div>',
+  ].join('');
+
+  function setStage(txt) { qs('stage-label').textContent = txt; }
+  function setDlInfo(txt) { qs('dl-info').textContent = txt; }
+  function setDlPct(p)    { qs('dl-bar').style.width = Math.min(100,p)+'%'; }
+  function setExCount(done,total) { qs('ex-count').textContent = done+' / '+total; }
+  function setExPct(p)    { qs('ex-bar').style.width = Math.min(100,p)+'%'; }
+  function setTicker(name){ qs('file-ticker').textContent = name ? '→ '+name : ''; }
+  function showError(msg) {
+    var el = qs('loader-error');
+    el.textContent = '✖ '+msg;
+    el.style.display = 'block';
+    setStage('Failed');
+    console.error('[FNAF Loader]', msg);
+  }
+  function hideLoader() {
+    pc.style.transition = 'opacity .4s';
+    pc.style.opacity = '0';
+    setTimeout(function(){ pc.style.display='none'; }, 450);
+  }
+
+  // ── Intercept fetch so we can show download progress ─────────────────────
+  // main.js (Clickteam export) calls fetch() for the game zip.
+  // We wrap it to report bytes as they stream in.
+  var _origFetch = window.fetch.bind(window);
+  window.fetch = function(input, init) {
+    var url = (typeof input === 'string') ? input : input.url;
+    // Only intercept same-origin-ish data fetches (zip files)
+    if (url && (url.endsWith('.zip') || url.includes('data'))) {
+      setStage('Downloading game…');
+      return _origFetch(input, init).then(function(response) {
+        if (!response.ok) {
+          showError('Download failed: HTTP ' + response.status + ' for ' + url);
+          return response; // pass through so main.js can handle
+        }
+        var contentLength = response.headers.get('Content-Length');
+        var total = contentLength ? parseInt(contentLength, 10) : 0;
+        var loaded = 0;
+        var reader = response.body.getReader();
+        var chunks = [];
+
+        function pump() {
+          return reader.read().then(function(ref) {
+            if (ref.done) {
+              var combined = new Uint8Array(loaded);
+              var offset = 0;
+              for (var i = 0; i < chunks.length; i++) {
+                combined.set(chunks[i], offset);
+                offset += chunks[i].length;
+              }
+              setDlPct(100);
+              setDlInfo(fmt(loaded));
+              setStage('Extracting files…');
+              // Return a fake Response wrapping the full buffer
+              return new Response(combined.buffer, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers
+              });
+            }
+            chunks.push(ref.value);
+            loaded += ref.value.length;
+            if (total > 0) {
+              var pct = (loaded / total) * 100;
+              setDlPct(pct);
+              setDlInfo(fmt(loaded) + ' / ' + fmt(total) + '  (' + pct.toFixed(1) + '%)');
+            } else {
+              setDlInfo(fmt(loaded) + ' downloaded');
+            }
+            return pump();
+          });
+        }
+        return pump();
+      });
+    }
+    return _origFetch(input, init);
+  };
+
+  // ── Intercept XHR for runtimes that use XMLHttpRequest instead of fetch ──
+  var _XHR = window.XMLHttpRequest;
+  window.XMLHttpRequest = function() {
+    var xhr = new _XHR();
+    var _open = xhr.open.bind(xhr);
+    var _send = xhr.send.bind(xhr);
+    var trackedUrl = '';
+    xhr.open = function(method, url) {
+      trackedUrl = url;
+      return _open.apply(xhr, arguments);
+    };
+    xhr.send = function() {
+      if (trackedUrl && (trackedUrl.endsWith('.zip') || trackedUrl.includes('data'))) {
+        setStage('Downloading game…');
+        xhr.addEventListener('progress', function(e) {
+          if (e.lengthComputable) {
+            var pct = (e.loaded / e.total) * 100;
+            setDlPct(pct);
+            setDlInfo(fmt(e.loaded) + ' / ' + fmt(e.total) + '  (' + pct.toFixed(1) + '%)');
+          } else {
+            setDlInfo(fmt(e.loaded) + ' downloaded');
+          }
+        });
+        xhr.addEventListener('load', function() {
+          setDlPct(100);
+          setStage('Extracting files…');
+        });
+      }
+      return _send.apply(xhr, arguments);
+    };
+    return xhr;
+  };
+  window.XMLHttpRequest.prototype = _XHR.prototype;
+
+  // ── Patch JSZip to report per-file extraction progress ───────────────────
+  // JSZip fires onUpdate({percent, currentFile}) during loadAsync
+  // We hook into the global JSZip object after it loads.
+  // Since JSZip loads via cdnjs (synchronous, before main.js), we patch
+  // main.js's loadAsync calls by wrapping JSZip.prototype.loadAsync.
+  function patchJSZip() {
+    if (!window.JSZip) return;
+    var _loadAsync = JSZip.prototype.loadAsync;
+    JSZip.prototype.loadAsync = function(data, opts) {
+      opts = opts || {};
+      var _userUpdate = opts.onUpdate;
+      opts.onUpdate = function(meta) {
+        if (meta.currentFile) setTicker(meta.currentFile);
+        if (typeof meta.percent === 'number') {
+          setExPct(meta.percent);
+        }
+        if (_userUpdate) _userUpdate(meta);
+      };
+      return _loadAsync.call(this, data, opts).then(function(zip) {
+        // Count files for the "N / total" display
+        var files = Object.keys(zip.files).filter(function(n){ return !zip.files[n].dir; });
+        var total = files.length;
+        var done = 0;
+        setExCount(0, total);
+
+        // Wrap each file's async method to count completions
+        files.forEach(function(name) {
+          var entry = zip.files[name];
+          var _async = entry.async.bind(entry);
+          entry.async = function(type) {
+            return _async(type).then(function(result) {
+              done++;
+              setExCount(done, total);
+              setTicker(name);
+              setExPct((done / total) * 100);
+              if (done === total) {
+                setTicker('');
+                setStage('Starting game…');
+                setTimeout(hideLoader, 800);
+              }
+              return result;
+            });
+          };
+        });
+        return zip;
+      });
+    };
+  }
+
+  // JSZip loads synchronously before main.js, so patch immediately
+  // But use a small delay to be safe in case it's deferred
+  if (window.JSZip) {
+    patchJSZip();
+  } else {
+    var _patchInterval = setInterval(function() {
+      if (window.JSZip) { patchJSZip(); clearInterval(_patchInterval); }
+    }, 50);
+  }
+
+})();
+</script>
+
+    <script src="main.js"></script>
+</body>
+</html>
